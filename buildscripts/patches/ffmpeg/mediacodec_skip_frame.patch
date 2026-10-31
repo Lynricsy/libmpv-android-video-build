@@ -1,0 +1,79 @@
+diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
+index bc176d8..47a2b85 100644
+--- a/libavcodec/mediacodecdec.c
++++ b/libavcodec/mediacodecdec.c
+@@ -59,6 +59,8 @@ typedef struct MediaCodecH264DecContext {
+     int use_ndk_codec;
+     // Ref. MediaFormat KEY_OPERATING_RATE
+     int operating_rate;
++    // highest HEVC TemporalId seen, for skip_frame
++    int max_tid;
+ } MediaCodecH264DecContext;
+ 
+ static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
+@@ -486,6 +488,52 @@ done:
+     return ret;
+ }
+ 
++/* MediaCodec is a black box and ignores skip_frame. Emulate AVDISCARD_NONREF
++ * by not queueing access units that no other picture references: H.264
++ * slices with nal_ref_idc == 0 and HEVC sub-layer non-reference pictures of
++ * the highest temporal sub-layer seen. Packets are Annex B at this point. */
++static int mediacodec_pkt_is_disposable(MediaCodecH264DecContext *s,
++                                        enum AVCodecID codec_id,
++                                        const AVPacket *pkt)
++{
++    const uint8_t *p = pkt->data;
++    const uint8_t *end = pkt->data + pkt->size;
++    int vcl = 0;
++
++    if (codec_id != AV_CODEC_ID_H264 && codec_id != AV_CODEC_ID_HEVC)
++        return 0;
++
++    for (; end - p > 3; p++) {
++        if (p[0] || p[1] || p[2] != 1)
++            continue;
++        p += 3;
++        if (codec_id == AV_CODEC_ID_H264) {
++            int type = p[0] & 0x1f;
++            if (type >= 1 && type <= 5) {
++                if (type == 5 || (p[0] >> 5) & 3)
++                    return 0;
++                vcl = 1;
++            }
++        } else {
++            int type, tid;
++            if (end - p < 2)
++                break;
++            type = (p[0] >> 1) & 0x3f;
++            tid  = (p[1] & 7) - 1;
++            if (type <= 31) {
++                if (tid > s->max_tid)
++                    s->max_tid = tid;
++                /* IRAP/reserved types, *_R types, or lower sub-layers that
++                 * higher sub-layers may still reference */
++                if (type > 14 || (type & 1) || tid < s->max_tid)
++                    return 0;
++                vcl = 1;
++            }
++        }
++    }
++    return vcl;
++}
++
+ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+ {
+     MediaCodecH264DecContext *s = avctx->priv_data;
+@@ -564,6 +612,12 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+         } else if (ret < 0) {
+             return ret;
+         }
++
++        if (avctx->skip_frame >= AVDISCARD_NONREF &&
++            mediacodec_pkt_is_disposable(s, avctx->codec_id, &s->buffered_pkt)) {
++            av_packet_unref(&s->buffered_pkt);
++            continue;
++        }
+     }
+ 
+     return AVERROR(EAGAIN);
